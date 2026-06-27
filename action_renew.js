@@ -226,6 +226,74 @@ function getUsers() {
     return [];
 }
 
+/**
+ * 核心功能：尝试绕过 ALTCHA 验证码。
+ * ALTCHA 渲染在 light DOM 中（无 iframe、无 Shadow DOM），
+ * 所以可以直接用 Playwright 选择器定位并点击复选框。
+ */
+async function attemptAltchaCaptcha(page) {
+    try {
+        // 方法 1: 直接通过 Playwright locator 点击 checkbox
+        const altchaCheckbox = page.locator('altcha-widget input[type="checkbox"]');
+        if (await altchaCheckbox.isVisible({ timeout: 1000 })) {
+            console.log('>> ALTCHA checkbox found via Playwright locator.');
+            await altchaCheckbox.click();
+            console.log('>> ALTCHA checkbox clicked. Waiting for PoW verification...');
+            await page.waitForTimeout(3000);
+
+            const isChecked = await altchaCheckbox.isChecked();
+            if (isChecked) {
+                console.log('>> ALTCHA verification successful (checkbox is checked).');
+                return true;
+            }
+
+            await page.waitForTimeout(3000);
+            const isCheckedAgain = await altchaCheckbox.isChecked();
+            if (isCheckedAgain) {
+                console.log('>> ALTCHA verification successful after extra wait.');
+                return true;
+            }
+
+            console.log('>> ALTCHA checkbox clicked but not verified yet. Proceeding anyway...');
+            return true;
+        }
+    } catch (e) { }
+
+    // 方法 2: 点击 .altcha-checkbox 包装 div
+    try {
+        const altchaDiv = page.locator('altcha-widget .altcha-checkbox');
+        if (await altchaDiv.isVisible({ timeout: 1000 })) {
+            console.log('>> ALTCHA .altcha-checkbox div found.');
+            await altchaDiv.click();
+            console.log('>> ALTCHA div clicked. Waiting for PoW verification...');
+            await page.waitForTimeout(5000);
+            return true;
+        }
+    } catch (e) { }
+
+    // 方法 3: 直接调用 verify() API
+    try {
+        const hasWidget = await page.evaluate(() => {
+            const widget = document.querySelector('altcha-widget');
+            return !!widget;
+        });
+        if (hasWidget) {
+            console.log('>> ALTCHA widget found. Calling verify() directly...');
+            await page.evaluate(() => {
+                const widget = document.querySelector('altcha-widget');
+                if (widget && typeof widget.verify === 'function') {
+                    widget.verify();
+                }
+            });
+            console.log('>> ALTCHA verify() called. Waiting for PoW...');
+            await page.waitForTimeout(5000);
+            return true;
+        }
+    } catch (e) { }
+
+    return false;
+}
+
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -362,38 +430,61 @@ async function attemptTurnstileCdp(page) {
                 await pwdInput.fill(user.password);
                 await page.waitForTimeout(500);
 
-                // --- Cloudflare Turnstile Bypass for Login ---
-                console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
-                let cdpClickResult = false;
+                // --- Captcha Bypass for Login (ALTCHA or Turnstile) ---
+                console.log('   >> 正在登录前检查验证码 (ALTCHA 或 Turnstile)...');
+                let captchaClickResult = false;
+                let isAltchaCaptcha = false;
+
                 for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
-                    cdpClickResult = await attemptTurnstileCdp(page);
-                    if (cdpClickResult) break;
+                    // 策略 0: ALTCHA
+                    if (findAttempt === 0 || findAttempt >= 2) {
+                        const altchaResult = await attemptAltchaCaptcha(page);
+                        if (altchaResult) {
+                            captchaClickResult = true;
+                            isAltchaCaptcha = true;
+                            console.log('   >> ALTCHA bypass succeeded for login.');
+                            break;
+                        }
+                    }
+
+                    // 策略 1: Turnstile Hook
+                    const turnstileResult = await attemptTurnstileCdp(page);
+                    if (turnstileResult) {
+                        captchaClickResult = true;
+                        console.log('   >> Turnstile Hook bypass succeeded for login.');
+                        break;
+                    }
+
                     await page.waitForTimeout(1000);
                 }
 
-                if (cdpClickResult) {
-                    console.log('   >> 登录 CDP 点击生效。正在等待最多 10秒 Cloudflare 成功标志...');
-                    for (let waitSec = 0; waitSec < 10; waitSec++) {
-                        const frames = page.frames();
-                        let isSuccess = false;
-                        for (const f of frames) {
-                            if (f.url().includes('cloudflare')) {
-                                try {
-                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                        isSuccess = true;
-                                        break;
-                                    }
-                                } catch (e) { }
+                if (captchaClickResult) {
+                    if (isAltchaCaptcha) {
+                        console.log('   >> ALTCHA 已通过登录验证。');
+                    } else {
+                        console.log('   >> 登录 CDP 点击生效。正在等待最多 10秒 Cloudflare 成功标志...');
+                        for (let waitSec = 0; waitSec < 10; waitSec++) {
+                            const loginFrames = page.frames();
+                            let isSuccess = false;
+                            for (const f of loginFrames) {
+                                if (f.url().includes('cloudflare')) {
+                                    try {
+                                        if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                            isSuccess = true;
+                                            break;
+                                        }
+                                    } catch (e) { }
+                                }
                             }
+                            if (isSuccess) {
+                                console.log('   >> 登录前 Turnstile 验证成功。');
+                                break;
+                            }
+                            await page.waitForTimeout(1000);
                         }
-                        if (isSuccess) {
-                            console.log('   >> 登录前 Turnstile 验证成功。');
-                            break;
-                        }
-                        await page.waitForTimeout(1000);
                     }
                 } else {
-                    console.log('   >> 登录前未检测到或未点击 Turnstile，继续操作...');
+                    console.log('   >> 登录前未检测到或未点击验证码，继续操作...');
                 }
                 // --------------------------------------------
 
@@ -404,7 +495,10 @@ async function attemptTurnstileCdp(page) {
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
                         console.error(`   >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
-                        const failShotPath = path.join(photoDir, `${safeUsername}.png`);
+                        const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                        if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                        const failSafeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+                        const failShotPath = path.join(failPhotoDir, `${failSafeUser}_login_fail.png`);
                         try { await page.screenshot({ path: failShotPath, fullPage: true }); } catch (e) { }
 
                         await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: 账号或密码错误`, failShotPath);
@@ -459,36 +553,60 @@ async function attemptTurnstileCdp(page) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
+                    // B. 检测验证码: ALTCHA 优先, Turnstile 作为备选
+                    console.log('正在检查验证码 (ALTCHA 或 Turnstile)...');
+                    let captchaClickResult = false;
+                    let isAltcha = false;
+
+                    for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
+                        // 策略 0: ALTCHA 验证码 (light DOM, 无 iframe, 最简单)
+                        if (findAttempt === 0 || findAttempt >= 2) {
+                            const altchaResult = await attemptAltchaCaptcha(page);
+                            if (altchaResult) {
+                                captchaClickResult = true;
+                                isAltcha = true;
+                                console.log('   >> Strategy 0 (ALTCHA) succeeded.');
+                                break;
+                            }
+                        }
+
+                        // 策略 1: Turnstile Hook (原有方式)
+                        const turnstileResult = await attemptTurnstileCdp(page);
+                        if (turnstileResult) {
+                            captchaClickResult = true;
+                            console.log('   >> Strategy 1 (Turnstile Hook) succeeded.');
+                            break;
+                        }
+
+                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/15] 验证码未找到...`);
                         await page.waitForTimeout(1000);
                     }
 
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
-                                    isTurnstileSuccess = true;
-                                    break;
+                    let isCaptchaSuccess = false;
+                    if (captchaClickResult) {
+                        if (isAltcha) {
+                            console.log('   >> ALTCHA 已点击。PoW 验证应正在进行...');
+                            isCaptchaSuccess = true;
+                        } else {
+                            // Turnstile: 等待 Cloudflare 验证
+                            console.log('   >> Turnstile CDP 点击生效。等待 8秒 Cloudflare 检查...');
+                            await page.waitForTimeout(8000);
+                            // 检查 Success 标志
+                            const frames = page.frames();
+                            for (const f of frames) {
+                                if (f.url().includes('cloudflare')) {
+                                    try {
+                                        if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                            console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
+                                            isCaptchaSuccess = true;
+                                            break;
+                                        }
+                                    } catch (e) { }
                                 }
-                            } catch (e) { }
+                            }
                         }
+                    } else {
+                        console.log('   >> 所有尝试后仍未检测到或点击验证码。');
                     }
 
                     // D. 准备点击确认
@@ -496,8 +614,6 @@ async function attemptTurnstileCdp(page) {
                     if (await confirmBtn.isVisible()) {
 
                         // User Requested: Screenshot BEFORE final click
-                        const fs = require('fs');
-                        const path = require('path');
                         const photoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                         const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
@@ -531,8 +647,6 @@ async function attemptTurnstileCdp(page) {
                                     console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
 
                                     // 截图证明
-                                    const fs = require('fs');
-                                    const path = require('path');
                                     const photoDir = path.join(process.cwd(), 'screenshots');
                                     if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                                     const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
@@ -567,8 +681,6 @@ async function attemptTurnstileCdp(page) {
                             console.log('   >> ✅ Modal closed. Renew successful!');
 
                             // 截图成功状态
-                            const fs = require('fs');
-                            const path = require('path');
                             const photoDir = path.join(process.cwd(), 'screenshots');
                             if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                             const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
@@ -601,9 +713,6 @@ async function attemptTurnstileCdp(page) {
         }
 
         // Snapshot before handling next user
-        // In GitHub Actions, we save to 'screenshots' dir
-        const fs = require('fs');
-        const path = require('path');
         const photoDir = path.join(process.cwd(), 'screenshots');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
         // Use safe filename
