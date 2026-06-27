@@ -204,6 +204,83 @@ function getUsers() {
 }
 
 /**
+ * 核心功能：尝试绕过 ALTCHA 验证码。
+ * ALTCHA 渲染在 light DOM 中（无 iframe、无 Shadow DOM），
+ * 所以可以直接用 Playwright 选择器定位并点击复选框。
+ */
+async function attemptAltchaCaptcha(page) {
+    try {
+        // 方法 1: 直接通过 Playwright locator 点击 checkbox
+        const altchaCheckbox = page.locator('altcha-widget input[type="checkbox"]');
+        if (await altchaCheckbox.isVisible({ timeout: 1000 })) {
+            console.log('>> ALTCHA checkbox found via Playwright locator.');
+            await altchaCheckbox.click();
+            console.log('>> ALTCHA checkbox clicked. Waiting for PoW verification...');
+            // ALTCHA 点击后会启动 Proof-of-Work 挑战，需要等待完成
+            await page.waitForTimeout(3000);
+
+            // 检查是否验证成功（checkbox 变为 checked 状态）
+            const isChecked = await altchaCheckbox.isChecked();
+            if (isChecked) {
+                console.log('>> ALTCHA verification successful (checkbox is checked).');
+                return true;
+            }
+
+            // 有些情况下 PoW 需要更长时间，多等一会
+            await page.waitForTimeout(3000);
+            const isCheckedAgain = await altchaCheckbox.isChecked();
+            if (isCheckedAgain) {
+                console.log('>> ALTCHA verification successful after extra wait.');
+                return true;
+            }
+
+            console.log('>> ALTCHA checkbox clicked but not verified yet. Proceeding anyway...');
+            return true; // 即使还没验证完，也返回 true 让后续流程继续
+        }
+    } catch (e) {
+        // 忽略
+    }
+
+    // 方法 2: 点击 .altcha-checkbox 包装 div
+    try {
+        const altchaDiv = page.locator('altcha-widget .altcha-checkbox');
+        if (await altchaDiv.isVisible({ timeout: 1000 })) {
+            console.log('>> ALTCHA .altcha-checkbox div found.');
+            await altchaDiv.click();
+            console.log('>> ALTCHA div clicked. Waiting for PoW verification...');
+            await page.waitForTimeout(5000);
+            return true;
+        }
+    } catch (e) {
+        // 忽略
+    }
+
+    // 方法 3: 直接调用 verify() API
+    try {
+        const hasWidget = await page.evaluate(() => {
+            const widget = document.querySelector('altcha-widget');
+            return !!widget;
+        });
+        if (hasWidget) {
+            console.log('>> ALTCHA widget found. Calling verify() directly...');
+            await page.evaluate(() => {
+                const widget = document.querySelector('altcha-widget');
+                if (widget && typeof widget.verify === 'function') {
+                    widget.verify();
+                }
+            });
+            console.log('>> ALTCHA verify() called. Waiting for PoW...');
+            await page.waitForTimeout(5000);
+            return true;
+        }
+    } catch (e) {
+        // 忽略
+    }
+
+    return false;
+}
+
+/**
  * 核心功能：遍历所有 Frames，查找被注入脚本标记的 Turnstile 坐标，
  * 计算绝对屏幕坐标，并使用 CDP 发送原生鼠标点击事件。
  */
@@ -359,40 +436,62 @@ async function attemptTurnstileCdp(page) {
                 await pwdInput.fill(user.password);
                 await page.waitForTimeout(500);
 
-                // --- Cloudflare Turnstile Bypass for Login ---
-                console.log('   >> Checking for Turnstile before login (using CDP bypass)...');
-                let cdpClickResult = false;
+                // --- Captcha Bypass for Login (ALTCHA or Turnstile) ---
+                console.log('   >> Checking for captcha before login...');
+                let captchaClickResult = false;
+                let isAltchaCaptcha = false;
+
                 for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
-                    cdpClickResult = await attemptTurnstileCdp(page);
-                    if (cdpClickResult) break;
-                    // console.log(`   >> [Login Find Attempt ${findAttempt + 1}/15] Turnstile checkbox not found yet...`);
+                    // 策略 0: ALTCHA
+                    if (findAttempt === 0 || findAttempt >= 2) {
+                        const altchaResult = await attemptAltchaCaptcha(page);
+                        if (altchaResult) {
+                            captchaClickResult = true;
+                            isAltchaCaptcha = true;
+                            console.log('   >> ALTCHA bypass succeeded for login.');
+                            break;
+                        }
+                    }
+
+                    // 策略 1: Turnstile Hook
+                    const turnstileResult = await attemptTurnstileCdp(page);
+                    if (turnstileResult) {
+                        captchaClickResult = true;
+                        console.log('   >> Turnstile Hook bypass succeeded for login.');
+                        break;
+                    }
+
                     await page.waitForTimeout(1000);
                 }
 
-                if (cdpClickResult) {
-                    console.log('   >> CDP Click active for login. Waiting up to 10s for Cloudflare success...');
-                    // Wait for the "Success!" mark in any cloudflare frame
-                    for (let waitSec = 0; waitSec < 10; waitSec++) {
-                        const frames = page.frames();
-                        let isSuccess = false;
-                        for (const f of frames) {
-                            if (f.url().includes('cloudflare')) {
-                                try {
-                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                        isSuccess = true;
-                                        break;
-                                    }
-                                } catch (e) { }
+                if (captchaClickResult) {
+                    if (isAltchaCaptcha) {
+                        console.log('   >> ALTCHA verified for login.');
+                    } else {
+                        console.log('   >> CDP Click active for login. Waiting up to 10s for Cloudflare success...');
+                        // Wait for the "Success!" mark in any cloudflare frame
+                        for (let waitSec = 0; waitSec < 10; waitSec++) {
+                            const loginFrames = page.frames();
+                            let isSuccess = false;
+                            for (const f of loginFrames) {
+                                if (f.url().includes('cloudflare')) {
+                                    try {
+                                        if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                            isSuccess = true;
+                                            break;
+                                        }
+                                    } catch (e) { }
+                                }
                             }
+                            if (isSuccess) {
+                                console.log('   >> Turnstile verification successful before login.');
+                                break;
+                            }
+                            await page.waitForTimeout(1000);
                         }
-                        if (isSuccess) {
-                            console.log('   >> Turnstile verification successful before login.');
-                            break;
-                        }
-                        await page.waitForTimeout(1000);
                     }
                 } else {
-                    console.log('   >> No Turnstile detected or clicked before login, proceeding anyway...');
+                    console.log('   >> No captcha detected or clicked before login, proceeding anyway...');
                 }
                 // --------------------------------------------
 
@@ -463,36 +562,60 @@ async function attemptTurnstileCdp(page) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('Checking for Turnstile (using CDP bypass)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [Find Attempt ${findAttempt + 1}/30] Turnstile checkbox not found yet...`);
+                    // B. 检测验证码: ALTCHA 优先, Turnstile 作为备选
+                    console.log('Checking for captcha (ALTCHA or Turnstile)...');
+                    let captchaClickResult = false;
+                    let isAltcha = false;
+
+                    for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
+                        // 策略 0: ALTCHA 验证码 (light DOM, 无 iframe, 最简单)
+                        if (findAttempt === 0 || findAttempt >= 2) {
+                            const altchaResult = await attemptAltchaCaptcha(page);
+                            if (altchaResult) {
+                                captchaClickResult = true;
+                                isAltcha = true;
+                                console.log('   >> Strategy 0 (ALTCHA) succeeded.');
+                                break;
+                            }
+                        }
+
+                        // 策略 1: Turnstile Hook (原有方式)
+                        const turnstileResult = await attemptTurnstileCdp(page);
+                        if (turnstileResult) {
+                            captchaClickResult = true;
+                            console.log('   >> Strategy 1 (Turnstile Hook) succeeded.');
+                            break;
+                        }
+
+                        console.log(`   >> [Find Attempt ${findAttempt + 1}/15] Captcha not found yet...`);
                         await page.waitForTimeout(1000);
                     }
 
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP Click active. Waiting 8s for Cloudflare check...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> Turnstile checkbox not confirmed after retries.');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> Detected "Success!" in Turnstile iframe.');
-                                    isTurnstileSuccess = true;
-                                    break;
+                    let isCaptchaSuccess = false;
+                    if (captchaClickResult) {
+                        if (isAltcha) {
+                            console.log('   >> ALTCHA clicked. PoW verification should be in progress...');
+                            isCaptchaSuccess = true; // ALTCHA 成功后不需要等待外部验证标志
+                        } else {
+                            // Turnstile: 等待 Cloudflare 验证
+                            console.log('   >> Turnstile CDP Click active. Waiting 8s for Cloudflare check...');
+                            await page.waitForTimeout(8000);
+                            // 检查 Success 标志
+                            const frames = page.frames();
+                            for (const f of frames) {
+                                if (f.url().includes('cloudflare')) {
+                                    try {
+                                        if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                            console.log('   >> Detected "Success!" in Turnstile iframe.');
+                                            isCaptchaSuccess = true;
+                                            break;
+                                        }
+                                    } catch (e) { }
                                 }
-                            } catch (e) { }
+                            }
                         }
+                    } else {
+                        console.log('   >> No captcha detected or clicked after all attempts.');
                     }
 
                     // D. 准备点击确认
